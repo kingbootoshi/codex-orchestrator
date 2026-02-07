@@ -42,7 +42,11 @@ export function sessionExists(sessionName: string): boolean {
 }
 
 /**
- * Create a new tmux session running codex (interactive mode)
+ * Create a new tmux session running codex exec (non-interactive mode)
+ *
+ * Uses `codex exec` which runs headlessly and writes JSONL output.
+ * The tmux session keeps the process alive and allows monitoring
+ * via `codex-agent capture/output/watch`.
  */
 export function createSession(options: {
   jobId: string;
@@ -61,63 +65,34 @@ export function createSession(options: {
   fs.writeFileSync(promptFile, options.prompt);
 
   try {
-    // Build the codex command (interactive mode)
-    // We use the interactive TUI so we can send messages later
+    // Build codex exec command (non-interactive, Rust CLI v0.98+)
+    // Reads prompt from stdin via the prompt file
+    // Note: `codex exec` does not support -a (approval policy).
+    // Use --full-auto for workspace-write, or --dangerously-bypass-approvals-and-sandbox
+    // for danger-full-access. read-only sandbox doesn't need approval flags.
+    const approvalFlag = options.sandbox === "danger-full-access"
+      ? "--dangerously-bypass-approvals-and-sandbox"
+      : "--full-auto";
+
     const codexArgs = [
-      `-c`, `model="${options.model}"`,
-      `-c`, `model_reasoning_effort="${options.reasoningEffort}"`,
-      `-c`, `skip_update_check=true`,
-      `-a`, `never`,
-      `-s`, options.sandbox,
+      "exec",
+      "-m", `"${options.model}"`,
+      "-c", `model_reasoning_effort="${options.reasoningEffort}"`,
+      "-s", options.sandbox,
+      approvalFlag,
+      "--json",
+      "-o", `"${config.jobsDir}/${options.jobId}.lastmsg"`,
     ].join(" ");
 
-    // Create tmux session with codex running
-    // Use script to capture all output, and keep shell alive after codex exits
-    // This allows us to capture the output even after completion
-    // Create detached session that runs codex and stays open after it exits
-    // Using script to log all terminal output
-    const shellCmd = `script -q "${logFile}" codex ${codexArgs}; echo "\\n\\n[codex-agent: Session complete. Press Enter to close.]"; read`;
+    // Run inside tmux so we can capture output and the process survives
+    // Use tee to log output (universally available, unlike `script`)
+    // Read prompt from file via stdin to handle any length/escaping
+    const shellCmd = `cat "${promptFile}" | codex ${codexArgs} - 2>&1 | tee "${logFile}"; echo "\\n\\n[codex-agent: Session complete. Press Enter to close.]"; read`;
 
     execSync(
       `tmux new-session -d -s "${sessionName}" -c "${options.cwd}" '${shellCmd}'`,
       { stdio: "pipe", cwd: options.cwd }
     );
-
-    // Give codex a moment to initialize and show update prompt if any
-    spawnSync("sleep", ["1"]);
-
-    // Skip update prompt if it appears by sending "3" (skip until next version)
-    // Then Enter to dismiss any remaining prompts
-    execSync(`tmux send-keys -t "${sessionName}" "3"`, { stdio: "pipe" });
-    spawnSync("sleep", ["0.5"]);
-    execSync(`tmux send-keys -t "${sessionName}" Enter`, { stdio: "pipe" });
-    spawnSync("sleep", ["1"]);
-
-    // Send the prompt (read from file to handle complex prompts)
-    // Using send-keys with the prompt content
-    const promptContent = options.prompt.replace(/'/g, "'\\''"); // Escape single quotes
-
-    // For very long prompts, we'll type it in chunks or use a different approach
-    if (options.prompt.length < 5000) {
-      // Send prompt directly for shorter prompts
-      // Use separate send-keys calls for text and Enter to ensure Enter is processed
-      execSync(
-        `tmux send-keys -t "${sessionName}" '${promptContent}'`,
-        { stdio: "pipe" }
-      );
-      // Small delay to let TUI process the text before Enter
-      spawnSync("sleep", ["0.3"]);
-      execSync(
-        `tmux send-keys -t "${sessionName}" Enter`,
-        { stdio: "pipe" }
-      );
-    } else {
-      // For long prompts, use load-buffer approach
-      execSync(`tmux load-buffer "${promptFile}"`, { stdio: "pipe" });
-      execSync(`tmux paste-buffer -t "${sessionName}"`, { stdio: "pipe" });
-      spawnSync("sleep", ["0.3"]);
-      execSync(`tmux send-keys -t "${sessionName}" Enter`, { stdio: "pipe" });
-    }
 
     return { sessionName, success: true };
   } catch (err) {
@@ -131,6 +106,11 @@ export function createSession(options: {
 
 /**
  * Send a message to a running codex session
+ *
+ * Note: With `codex exec` (non-interactive), mid-session messages are not
+ * natively supported. This sends keys to the tmux pane which only works
+ * if codex is waiting for stdin input. For most use cases, kill and
+ * respawn with an updated prompt instead.
  */
 export function sendMessage(sessionName: string, message: string): boolean {
   if (!sessionExists(sessionName)) {
