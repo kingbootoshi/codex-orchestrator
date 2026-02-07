@@ -14,6 +14,15 @@ NC='\033[0m' # No Color
 INSTALL_DIR="${CODEX_ORCHESTRATOR_HOME:-$HOME/.codex-orchestrator}"
 REPO_URL="https://github.com/kingbootoshi/codex-orchestrator.git"
 
+# Resolve the directory where this script lives
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SOURCE" ]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+  SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+  [[ $SCRIPT_SOURCE != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+
 info() { echo -e "${BLUE}[info]${NC} $1"; }
 success() { echo -e "${GREEN}[ok]${NC} $1"; }
 warn() { echo -e "${YELLOW}[warn]${NC} $1"; }
@@ -27,13 +36,7 @@ detect_platform() {
     Linux*)   PLATFORM="linux" ;;
     Darwin*)  PLATFORM="macos" ;;
     CYGWIN*|MINGW*|MSYS*)
-      error "Windows is not directly supported."
-      echo ""
-      echo "Please use WSL (Windows Subsystem for Linux):"
-      echo "  1. Install WSL: wsl --install"
-      echo "  2. Open a WSL terminal"
-      echo "  3. Re-run this script inside WSL"
-      exit 1
+      PLATFORM="windows"
       ;;
     *)
       error "Unsupported platform: $(uname -s)"
@@ -42,6 +45,195 @@ detect_platform() {
   esac
 
   info "Platform: $PLATFORM ($(uname -m))"
+}
+
+# -------------------------------------------------------------------
+# Convert a Git Bash / MSYS path to a WSL /mnt/ path
+# -------------------------------------------------------------------
+convert_to_wsl_path() {
+  local win_path="$1"
+  if [[ "$win_path" =~ ^/([a-zA-Z])/ ]]; then
+    echo "/mnt/${BASH_REMATCH[1],,}/${win_path:3}"
+  elif [[ "$win_path" =~ ^([a-zA-Z]):\\ ]]; then
+    local drive="${win_path:0:1}"
+    drive="${drive,,}"
+    local rest="${win_path:3}"
+    rest="${rest//\\//}"
+    echo "/mnt/${drive}/${rest}"
+  elif [[ "$win_path" =~ ^([a-zA-Z]):/ ]]; then
+    local drive="${win_path:0:1}"
+    drive="${drive,,}"
+    echo "/mnt/${drive}/${win_path:3}"
+  else
+    echo "$win_path"
+  fi
+}
+
+# -------------------------------------------------------------------
+# Windows: install via WSL and create bridge shim
+# -------------------------------------------------------------------
+install_via_wsl() {
+  info "Windows detected — installing via WSL"
+  echo ""
+
+  # Check wsl.exe is available
+  if ! command -v wsl.exe &>/dev/null && ! command -v wsl &>/dev/null; then
+    error "WSL is not installed."
+    echo ""
+    echo "Install WSL from an admin PowerShell:"
+    echo "  wsl --install"
+    echo ""
+    echo "Then restart your computer and re-run this script."
+    exit 1
+  fi
+
+  # Check WSL has a default distro configured
+  local wsl_cmd="wsl.exe"
+  command -v wsl.exe &>/dev/null || wsl_cmd="wsl"
+
+  if ! $wsl_cmd --status &>/dev/null; then
+    error "WSL is installed but no default distribution is configured."
+    echo ""
+    echo "Set up a Linux distribution:"
+    echo "  wsl --install -d Ubuntu"
+    echo ""
+    echo "Then re-run this script."
+    exit 1
+  fi
+
+  success "WSL is available"
+
+  # Convert this script's path to WSL format and run inside WSL
+  local wsl_script_path
+  wsl_script_path="$(convert_to_wsl_path "$SCRIPT_DIR/install.sh")"
+
+  info "Running install inside WSL..."
+  echo ""
+
+  if ! $wsl_cmd -e bash -c "bash '${wsl_script_path}'"; then
+    error "WSL installation failed."
+    exit 1
+  fi
+
+  success "WSL-side installation complete"
+  echo ""
+
+  # Create Windows-side bridge shim
+  create_windows_shim
+
+  # Verify the shim works
+  echo ""
+  info "Verifying Windows bridge..."
+  echo ""
+
+  local shim_path="$HOME/bin/codex-agent"
+  if [ -f "$shim_path" ] && bash "$shim_path" health; then
+    echo ""
+    success "Windows WSL bridge is working!"
+    echo ""
+    echo "Quick start:"
+    echo "  codex-agent start \"Review this codebase for issues\" --map"
+    echo "  codex-agent jobs --json"
+    echo "  codex-agent capture <jobId>"
+    echo ""
+    echo "All commands work directly from Git Bash or PowerShell."
+    echo "Windows paths are automatically converted to WSL paths."
+  else
+    error "Bridge verification failed."
+    echo ""
+    echo "Try running manually:"
+    echo "  bash $shim_path health"
+    exit 1
+  fi
+
+  if ! command -v codex-agent &>/dev/null; then
+    warn "codex-agent is not on your PATH."
+    echo ""
+    echo "Add this to your shell profile:"
+    echo "  export PATH=\"\$HOME/bin:\$PATH\""
+  fi
+}
+
+# -------------------------------------------------------------------
+# Create the Windows-side codex-agent shim and WSL bridge
+# -------------------------------------------------------------------
+create_windows_shim() {
+  local bin_dir="$HOME/bin"
+  local shim_path="$bin_dir/codex-agent"
+  local bridge_path="$bin_dir/codex-agent-wsl.sh"
+
+  mkdir -p "$bin_dir"
+
+  info "Creating WSL bridge at $bridge_path"
+
+  # Copy the bridge wrapper from the scripts directory
+  local source_bridge="$SCRIPT_DIR/codex-agent-wsl.sh"
+  if [ -f "$source_bridge" ]; then
+    cp "$source_bridge" "$bridge_path"
+  else
+    # Generate inline if source not found (e.g. curl install)
+    cat > "$bridge_path" << 'BRIDGE_EOF'
+#!/bin/bash
+# codex-agent WSL bridge - Routes commands through WSL with path conversion
+
+convert_win_to_wsl() {
+    local win_path="$1"
+    if [[ "$win_path" =~ ^/([a-zA-Z])/ ]]; then
+        echo "/mnt/${BASH_REMATCH[1],,}/${win_path:3}"
+    elif [[ "$win_path" =~ ^([a-zA-Z]):\\ ]]; then
+        local drive="${win_path:0:1}"
+        drive="${drive,,}"
+        local rest="${win_path:3}"
+        rest="${rest//\\//}"
+        echo "/mnt/${drive}/${rest}"
+    elif [[ "$win_path" =~ ^([a-zA-Z]):/ ]]; then
+        local drive="${win_path:0:1}"
+        drive="${drive,,}"
+        echo "/mnt/${drive}/${win_path:3}"
+    else
+        echo "$win_path"
+    fi
+}
+
+ARGS=()
+SKIP_NEXT=false
+
+for i in "$@"; do
+    if $SKIP_NEXT; then
+        SKIP_NEXT=false
+        ARGS+=("$(convert_win_to_wsl "$i")")
+        continue
+    fi
+    case "$i" in
+        -d|--dir|-f|--file)
+            ARGS+=("$i")
+            SKIP_NEXT=true
+            ;;
+        *)
+            ARGS+=("$i")
+            ;;
+    esac
+done
+
+WSL_CWD="$(convert_win_to_wsl "$(pwd)")"
+
+wsl -e bash -lc "cd '${WSL_CWD}' 2>/dev/null; export PATH=\"\$HOME/.bun/bin:\$HOME/.codex-orchestrator/bin:\$PATH\"; codex-agent ${ARGS[*]}"
+BRIDGE_EOF
+  fi
+
+  chmod +x "$bridge_path"
+
+  info "Creating shim at $shim_path"
+
+  cat > "$shim_path" << SHIM_EOF
+#!/bin/bash
+# codex-agent — Windows WSL bridge shim
+exec bash "$bridge_path" "\$@"
+SHIM_EOF
+
+  chmod +x "$shim_path"
+
+  success "Windows shim created at $shim_path"
 }
 
 # -------------------------------------------------------------------
@@ -281,6 +473,12 @@ main() {
 
   detect_platform
   echo ""
+
+  # Windows: delegate to WSL and create bridge shim
+  if [ "$PLATFORM" = "windows" ]; then
+    install_via_wsl
+    return
+  fi
 
   check_tmux
   check_bun
