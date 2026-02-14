@@ -76,7 +76,13 @@ export function createSession(options: {
     // This allows us to capture the output even after completion
     // Create detached session that runs codex and stays open after it exits
     // Using script to log all terminal output
-    const shellCmd = `script -q "${logFile}" codex ${codexArgs}; echo "\\n\\n[codex-agent: Session complete. Press Enter to close.]"; read`;
+    // AI-DEVNOTE (2026-02-14): Platform-aware script command.
+    // macOS: script -q <file> <command>
+    // Linux: script -q -c "<command>" <file>
+    const isLinux = process.platform === "linux";
+    const shellCmd = isLinux
+      ? `script -q -c "codex ${codexArgs}" "${logFile}"; echo "\\n\\n[codex-agent: Session complete. Press Enter to close.]"; read`
+      : `script -q "${logFile}" codex ${codexArgs}; echo "\\n\\n[codex-agent: Session complete. Press Enter to close.]"; read`;
 
     execSync(
       `tmux new-session -d -s "${sessionName}" -c "${options.cwd}" '${shellCmd}'`,
