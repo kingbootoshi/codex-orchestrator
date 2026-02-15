@@ -86,7 +86,7 @@ codex-agent/
 | `SandboxMode` | type | "read-only" \| "workspace-write" \| "danger-full-access" |
 
 **Key Values**:
-- `model`: "gpt-5.3-codex"
+- `model`: "gpt-5.3-codex-spark"
 - `jobsDir`: `~/.codex-agent/jobs`
 - `tmuxPrefix`: "codex-agent"
 - `defaultTimeout`: 60 minutes

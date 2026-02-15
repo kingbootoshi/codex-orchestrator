@@ -7,6 +7,7 @@ import { config, ReasoningEffort, SandboxMode } from "./config.ts";
 import {
   startJob,
   loadJob,
+  saveJob,
   listJobs,
   killJob,
   refreshJobStatus,
@@ -17,11 +18,14 @@ import {
   getJobOutput,
   getJobFullOutput,
   getAttachCommand,
+  isJobIdle,
+  getTurnSignal,
   Job,
   getJobsJson,
 } from "./jobs.ts";
 import { loadFiles, formatPromptWithFiles, estimateTokens, loadCodebaseMap } from "./files.ts";
 import { isTmuxAvailable, listSessions } from "./tmux.ts";
+import { cleanTerminalOutput } from "./output-cleaner.ts";
 
 const HELP = `
 Codex Agent - Delegate tasks to GPT Codex agents (tmux-based)
@@ -29,6 +33,7 @@ Codex Agent - Delegate tasks to GPT Codex agents (tmux-based)
 Usage:
   codex-agent start "prompt" [options]   Start agent in tmux session
   codex-agent status <jobId>             Check job status
+  codex-agent await-turn <jobId>         Wait for agent to finish current turn
   codex-agent send <jobId> "message"     Send message to running agent
   codex-agent capture <jobId> [lines]    Capture recent output (default: 50 lines)
   codex-agent output <jobId>             Get full session output
@@ -42,14 +47,17 @@ Usage:
 
 Options:
   -r, --reasoning <level>    Reasoning effort: low, medium, high, xhigh (default: xhigh)
-  -m, --model <model>        Model name (default: gpt-5.3-codex)
+  -m, --model <model>        Model name (default: gpt-5.3-codex-spark)
   -s, --sandbox <mode>       Sandbox: read-only, workspace-write, danger-full-access
+  -w, --wait                 Wait for completion before exiting
+  --notify-on-complete <cmd>  Run command when job completes
   -f, --file <glob>          Include files matching glob (can repeat)
   -d, --dir <path>           Working directory (default: cwd)
   --parent-session <id>      Parent session ID for linkage
   --map                      Include codebase map if available
   --dry-run                  Show prompt without executing
-  --strip-ansi               Remove ANSI escape codes from output (for capture/output)
+  --strip-ansi               Remove ANSI and Codex TUI noise from output (for capture/output)
+  --clean                    Alias for --strip-ansi
   --json                     Output JSON (jobs command only)
   --limit <n>                Limit jobs shown (jobs command only)
   --all                      Show all jobs (jobs command only)
@@ -82,6 +90,8 @@ interface Options {
   reasoning: ReasoningEffort;
   model: string;
   sandbox: SandboxMode;
+  waitForCompletion: boolean;
+  notifyOnComplete: string | null;
   files: string[];
   dir: string;
   includeMap: boolean;
@@ -93,18 +103,6 @@ interface Options {
   jobsAll: boolean;
 }
 
-function stripAnsiCodes(text: string): string {
-  return text
-    // Remove ANSI escape sequences (colors, cursor movements, etc)
-    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-    // Remove other escape sequences (OSC, etc)
-    .replace(/\x1b\][^\x07]*\x07/g, '')
-    // Remove carriage returns (used for spinner overwrites)
-    .replace(/\r/g, '')
-    // Remove other control characters except newline and tab
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
-}
-
 function parseArgs(args: string[]): {
   command: string;
   positional: string[];
@@ -114,6 +112,8 @@ function parseArgs(args: string[]): {
     reasoning: config.defaultReasoningEffort,
     model: config.model,
     sandbox: config.defaultSandbox,
+    waitForCompletion: false,
+    notifyOnComplete: null,
     files: [],
     dir: process.cwd(),
     includeMap: false,
@@ -156,6 +156,11 @@ function parseArgs(args: string[]): {
       }
     } else if (arg === "-f" || arg === "--file") {
       options.files.push(args[++i]);
+    } else if (arg === "-w" || arg === "--wait") {
+      options.waitForCompletion = true;
+    } else if (arg === "--notify-on-complete") {
+      options.notifyOnComplete = args[++i] ?? null;
+      options.waitForCompletion = true;
     } else if (arg === "-d" || arg === "--dir") {
       options.dir = args[++i];
     } else if (arg === "--parent-session") {
@@ -164,7 +169,7 @@ function parseArgs(args: string[]): {
       options.includeMap = true;
     } else if (arg === "--dry-run") {
       options.dryRun = true;
-    } else if (arg === "--strip-ansi") {
+    } else if (arg === "--strip-ansi" || arg === "--clean") {
       options.stripAnsi = true;
     } else if (arg === "--json") {
       options.json = true;
@@ -244,6 +249,49 @@ function sortJobsRunningFirst(jobs: Job[]): Job[] {
 function applyJobsLimit<T>(jobs: T[], limit: number | null): T[] {
   if (!limit || limit <= 0) return jobs;
   return jobs.slice(0, limit);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForJobCompletion(
+  jobId: string,
+  pollIntervalMs = 1000
+): Promise<Job | null> {
+  while (true) {
+    const refreshed = refreshJobStatus(jobId);
+    if (!refreshed || refreshed.status !== "running") {
+      return refreshed;
+    }
+
+    await sleep(pollIntervalMs);
+  }
+}
+
+async function notifyOnCompletion(
+  job: Job,
+  notifyCommand: string | null
+): Promise<void> {
+  process.stdout.write("\x07");
+
+  if (!notifyCommand) return;
+
+  try {
+    const { spawnSync } = await import("child_process");
+    spawnSync(notifyCommand, {
+      stdio: "inherit",
+      shell: true,
+      env: {
+        ...process.env,
+        CODEX_AGENT_JOB_ID: job.id,
+        CODEX_AGENT_STATUS: job.status,
+        CODEX_AGENT_ERROR: job.error || "",
+      },
+    });
+  } catch {
+    // Best effort only; completion ping already emitted.
+  }
 }
 
 async function main() {
@@ -347,6 +395,27 @@ async function main() {
         console.log(`  Capture output:  codex-agent capture ${job.id}`);
         console.log(`  Send message:    codex-agent send ${job.id} "message"`);
         console.log(`  Attach session:  tmux attach -t ${job.tmuxSession}`);
+
+        if (options.waitForCompletion) {
+          const completed = await waitForJobCompletion(job.id);
+          if (!completed) {
+            console.error("Job disappeared while waiting");
+            process.exit(1);
+          }
+
+          console.log(`\nJob ${completed.id} completed with status: ${completed.status}`);
+          if (completed.status === "failed" && completed.error) {
+            console.log(`Error: ${completed.error}`);
+          }
+
+          const finalOutput = getJobFullOutput(job.id);
+          if (finalOutput) {
+            console.log("");
+            console.log(finalOutput);
+          }
+
+          await notifyOnCompletion(completed, options.notifyOnComplete);
+        }
         break;
       }
 
@@ -379,6 +448,107 @@ async function main() {
         if (job.error) {
           console.log(`Error: ${job.error}`);
         }
+        if (job.turnState) {
+          if (job.turnState === "context_limit") {
+            console.log("Turn state: context_limit (context window exceeded)");
+          } else {
+            console.log(`Turn state: ${job.turnState}`);
+          }
+        }
+        if (job.turnCount) {
+          console.log(`Turns completed: ${job.turnCount}`);
+        }
+        if (job.lastTurnCompletedAt) {
+          console.log(`Last turn: ${job.lastTurnCompletedAt}`);
+        }
+        if (job.lastAgentMessage) {
+          console.log(`Last message: ${job.lastAgentMessage}`);
+        }
+        break;
+      }
+
+      case "await-turn": {
+        if (positional.length === 0) {
+          console.error("Error: No job ID provided");
+          process.exit(1);
+        }
+
+        const awaitJobId = positional[0];
+        const awaitJob = loadJob(awaitJobId);
+
+        if (!awaitJob) {
+          console.error(`Job ${awaitJobId} not found`);
+          process.exit(1);
+        }
+
+        if (awaitJob.status !== "running") {
+          console.error(`Job ${awaitJobId} is not running (status: ${awaitJob.status})`);
+          process.exit(1);
+        }
+
+        // Check if already idle
+        const existingSignal = getTurnSignal(awaitJobId);
+        if (existingSignal) {
+          console.log(existingSignal.lastAgentMessage || "Turn complete");
+          process.exit(0);
+        }
+
+        console.error(`Waiting for turn completion... (job: ${awaitJobId})`);
+
+        let awaitTurnPollCount = 0;
+        const contextWindowText = "Codex ran out of room in the model's context window";
+        const awaitPoll = setInterval(() => {
+          awaitTurnPollCount += 1;
+
+          // Check for turn signal
+          const signal = getTurnSignal(awaitJobId);
+          if (signal) {
+            clearInterval(awaitPoll);
+            console.log(signal.lastAgentMessage || "Turn complete");
+            process.exit(0);
+          }
+
+          // Check for context window exhaustion every 5th poll (~2.5s)
+          if (awaitTurnPollCount % 5 === 0) {
+            const paneOutput = getJobOutput(awaitJobId, 10);
+            if (paneOutput && (paneOutput.includes("ran out of room") || paneOutput.includes("context window"))) {
+              const current = loadJob(awaitJobId);
+              if (current) {
+                current.turnState = "context_limit";
+                current.error = contextWindowText;
+                saveJob(current);
+              }
+
+              clearInterval(awaitPoll);
+              console.error("Agent hit context window limit");
+              console.log(contextWindowText);
+              process.exit(2);
+            }
+          }
+
+          // Check if job ended entirely
+          const current = refreshJobStatus(awaitJobId);
+          if (!current || current.status !== "running") {
+            clearInterval(awaitPoll);
+            console.error(`Job ended: ${current?.status || "unknown"}`);
+            process.exit(current?.status === "completed" ? 0 : 1);
+          }
+        }, 500);
+
+        // Timeout after 30 minutes
+        setTimeout(() => {
+          clearInterval(awaitPoll);
+          console.error("Timeout waiting for turn completion");
+          process.exit(1);
+        }, 30 * 60 * 1000);
+
+        // Handle Ctrl+C
+        process.on("SIGINT", () => {
+          clearInterval(awaitPoll);
+          console.error("\nStopped waiting");
+          process.exit(0);
+        });
+
         break;
       }
 
@@ -412,7 +582,7 @@ async function main() {
 
         if (output) {
           if (options.stripAnsi) {
-            output = stripAnsiCodes(output);
+            output = cleanTerminalOutput(output);
           }
           console.log(output);
         } else {
@@ -431,7 +601,7 @@ async function main() {
         let output = getJobFullOutput(positional[0]);
         if (output) {
           if (options.stripAnsi) {
-            output = stripAnsiCodes(output);
+            output = cleanTerminalOutput(output);
           }
           console.log(output);
         } else {
@@ -626,6 +796,24 @@ async function main() {
           console.log(`Job started: ${job.id}`);
           console.log(`tmux session: ${job.tmuxSession}`);
           console.log(`Attach: tmux attach -t ${job.tmuxSession}`);
+
+          if (options.waitForCompletion) {
+            const completed = await waitForJobCompletion(job.id);
+            if (!completed) {
+              console.error("Job disappeared while waiting");
+              process.exit(1);
+            }
+            console.log(`\nJob ${completed.id} completed with status: ${completed.status}`);
+            if (completed.status === "failed" && completed.error) {
+              console.log(`Error: ${completed.error}`);
+            }
+            const finalOutput = getJobFullOutput(job.id);
+            if (finalOutput) {
+              console.log("");
+              console.log(finalOutput);
+            }
+            await notifyOnCompletion(completed, options.notifyOnComplete);
+          }
         } else {
           console.log(HELP);
         }

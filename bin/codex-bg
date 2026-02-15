@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  codex-bg [options] -- <codex-agent start args>
+
+Options:
+  -n, --notify-on-complete <command>   Run command when job completes
+  -i, --poll-interval <seconds>        Poll interval for status checks (default: 2)
+  -o, --print-output                   Print final transcript after completion
+  -t, --watch-turns                    Print notification on each turn completion
+  -h, --help                           Show this help
+
+Examples:
+  codex-bg -- codex-agent start "Audit auth flow" -r high --map
+  codex-bg -n 'terminal-notifier -message "codex done"' -- codex-agent start "Run tests"
+  codex-bg -t -- codex-agent start "Refactor module" -s read-only
+
+Output:
+  CODEX_AGENT_JOB_ID=<id>
+  CODEX_AGENT_TURN_COMPLETE=<id>  (when -t is used)
+  CODEX_AGENT_DONE=<id> status=<status>
+EOF
+}
+
+poll_interval="2"
+notify_command=""
+print_output="false"
+watch_turns="false"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--notify-on-complete)
+      notify_command="${2:-}"
+      shift 2
+      ;;
+    -i|--poll-interval)
+      poll_interval="${2:-}"
+      shift 2
+      ;;
+    -o|--print-output)
+      print_output="true"
+      shift
+      ;;
+    -t|--watch-turns)
+      watch_turns="true"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 1
+fi
+
+if [[ "$1" != "codex-agent" ]]; then
+  echo "Expected command to start with 'codex-agent' after --" >&2
+  usage >&2
+  exit 1
+fi
+
+start_output="$(codex-agent "$@" 2>&1)"
+echo "$start_output"
+
+job_id="$(awk '/^Job started:/ {print $3}' <<<"$start_output" | tail -n 1 | tr -d '[:space:]')"
+if [[ -z "$job_id" ]]; then
+  echo "Unable to parse job id from codex-agent output" >&2
+  exit 1
+fi
+
+echo "CODEX_AGENT_JOB_ID=$job_id"
+
+signal_file="$HOME/.codex-agent/jobs/${job_id}.turn-complete"
+turn_notified="false"
+
+wait_for_done() {
+  while true; do
+    # Check for turn completion signal (cheap file existence check)
+    if [[ "$watch_turns" == "true" && -f "$signal_file" ]]; then
+      if [[ "$turn_notified" == "false" ]]; then
+        echo "CODEX_AGENT_TURN_COMPLETE=$job_id"
+        turn_notified="true"
+      fi
+    else
+      # Signal cleared (agent working again) - reset notification
+      turn_notified="false"
+    fi
+
+    status_output="$(codex-agent status "$job_id" 2>&1 || true)"
+    status="$(awk '/^Status:/ {print $2}' <<<"$status_output" | tail -n 1)"
+
+    if [[ "$status" == "completed" || "$status" == "failed" ]]; then
+      echo "CODEX_AGENT_DONE=$job_id status=$status"
+
+      if [[ "$print_output" == "true" ]]; then
+        codex-agent capture "$job_id" 200
+      fi
+
+      if [[ -n "$notify_command" ]]; then
+        CODEX_AGENT_JOB_ID="$job_id" CODEX_AGENT_STATUS="$status" \
+          bash -lc "$notify_command" || true
+      fi
+      return 0
+    fi
+
+    if [[ "$status_output" == *"not found"* ]]; then
+      echo "Job $job_id missing while waiting for completion" >&2
+      return 1
+    fi
+
+    sleep "$poll_interval"
+  done
+}
+
+wait_for_done

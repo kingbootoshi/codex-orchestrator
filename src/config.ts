@@ -2,7 +2,7 @@
 
 export const config = {
   // Default model
-  model: "gpt-5.3-codex",
+  model: "gpt-5.3-codex-spark",
 
   // Reasoning effort levels
   reasoningEfforts: ["low", "medium", "high", "xhigh"] as const,
@@ -23,6 +23,7 @@ export const config = {
 
   // tmux session prefix
   tmuxPrefix: "codex-agent",
+
 };
 
 export type ReasoningEffort = typeof config.reasoningEfforts[number];

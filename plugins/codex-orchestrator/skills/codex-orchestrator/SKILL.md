@@ -176,6 +176,7 @@ Detect where you are based on context:
 4. **Codebase Map Always** - Every agent gets `--map` for context.
 5. **PRDs Drive Implementation** - Complex changes get PRDs in docs/prds/.
 6. **Patience is Required** - Agents take time. This is normal and expected.
+7. **Turn-Aware by Default** - Use `await-turn` to block until agents respond. No manual polling.
 
 ## Agent Timing Expectations (CRITICAL - READ THIS)
 
@@ -204,8 +205,9 @@ Detect where you are based on context:
 - Ask the user "should I check on the agent?" after 15 minutes
 
 **DO:**
-- Check progress with `codex-agent capture <id>` periodically
-- Send clarifying messages if the agent seems genuinely stuck
+- Use `codex-agent await-turn <id>` in a background Bash task to get notified instantly when an agent finishes
+- Check progress with `codex-agent capture <id>` if you need to peek before a turn completes
+- Send clarifying messages if the agent seems genuinely stuck (no progress for 5+ minutes)
 - Let agents finish their work - they are thorough for a reason
 - Trust the process - quality takes time
 
@@ -234,11 +236,129 @@ The CLI ships with strong defaults so most commands need minimal flags:
 
 | Setting | Default | Why |
 |---------|---------|-----|
-| Model | `gpt-5.3-codex` | Latest and most capable Codex model |
+| Model | `gpt-5.3-codex-spark` | Latest and most capable Codex model |
 | Reasoning | `xhigh` | Maximum reasoning depth - agents think deeply |
 | Sandbox | `workspace-write` | Agents can modify files by default |
 
 You almost never need to override these. The main flags you'll use are `--map` (include codebase context), `-s read-only` (for research tasks), and `-f` (include specific files).
+
+## Turn-Aware Orchestration
+
+Codex agents have a built-in notify hook that fires the instant an agent finishes responding. This means you get notified within milliseconds of an agent going idle - no polling, no delays, no forgetting to check.
+
+### How It Works
+
+When `codex-agent start` spawns an agent, it injects a per-job notify hook via `-c notify=...`. When the Codex agent finishes a turn, Codex calls our script with a JSON payload containing the agent's response. The script writes a signal file at `~/.codex-agent/jobs/<jobId>.turn-complete`. The `await-turn` command blocks until that file appears.
+
+Each job gets its own notify command with its own job ID baked in. 16 agents running in the same directory? No ambiguity - each one's hook writes to its own signal file.
+
+### The Standard Orchestration Loop
+
+This is how you should interact with agents. Use this pattern every time.
+
+**Step 1: Spawn** (foreground, instant - get the job ID)
+
+```bash
+codex-agent start "Your task prompt here" -r high --map -s read-only
+```
+
+Parse the job ID from the output.
+
+**Step 2: Await** (blocks until agent responds)
+
+Use the Bash tool with `run_in_background: true`:
+
+```bash
+JOB_ID="abc12345"
+codex-agent await-turn "$JOB_ID"
+echo "CODEX_AGENT_TURN_COMPLETE=$JOB_ID"
+codex-agent status "$JOB_ID"
+```
+
+This gives you a `task_id` from Claude's background task system. When the agent finishes its turn, `TaskOutput` returns the agent's response.
+
+**Step 3: React** - Read the output, decide what to do next:
+- Send a follow-up: `codex-agent send $id "Now do X"`
+- Close it: `codex-agent send $id "/quit"`
+- Just read more: `codex-agent capture $id 200 --clean`
+
+If you send a follow-up, repeat Step 2 to await the next turn.
+
+### Spawning Multiple Agents in Parallel
+
+When spawning N agents, make all Step 1 calls in parallel (single message, multiple Bash tool calls). Then make all Step 2 calls in parallel (single message, multiple Bash tool calls with `run_in_background: true`).
+
+```
+Message 1 (parallel foreground):
+  - Bash: codex-agent start "Research task A" --map -s read-only
+  - Bash: codex-agent start "Research task B" --map -s read-only
+  - Bash: codex-agent start "Research task C" --map -s read-only
+
+Message 2 (parallel background):
+  - Bash (bg): codex-agent await-turn <jobA>; echo "DONE_A"; codex-agent status <jobA>
+  - Bash (bg): codex-agent await-turn <jobB>; echo "DONE_B"; codex-agent status <jobB>
+  - Bash (bg): codex-agent await-turn <jobC>; echo "DONE_C"; codex-agent status <jobC>
+```
+
+Each background task notifies you independently the instant its agent finishes. No 3-second poll gaps. No wasted time.
+
+### Multi-Turn Conversation Pattern
+
+For tasks requiring back-and-forth with an agent:
+
+```bash
+# Spawn
+codex-agent start "Investigate the auth module" --map -s read-only
+# Block until agent responds
+codex-agent await-turn $id
+# Read what it said
+codex-agent status $id
+# Send follow-up
+codex-agent send $id "Now check the database layer"
+# Block again
+codex-agent await-turn $id
+# Read response, close when done
+codex-agent send $id "/quit"
+```
+
+### Checking on Agents Without Waiting
+
+You do NOT have to use await-turn. At any time you can still:
+
+```bash
+codex-agent status <jobId>           # includes turn state, last message
+codex-agent capture <jobId> 50       # peek at recent output
+codex-agent send <jobId> "message"   # steer the agent
+codex-agent jobs --json              # check all agents at once
+```
+
+### When "completed" Actually Fires
+
+A Codex job status stays `running` after the agent has answered - it only transitions to `completed` when the session is closed. This happens when:
+- The agent finishes and exits naturally
+- You send `/quit` via `codex-agent send <id> "/quit"`
+- The session times out from inactivity
+
+So if you use `await-turn`, you get the agent's response immediately. Then you decide whether to send a follow-up or close the session.
+
+### Signal File Interface (For Advanced Bash Scripting)
+
+The signal file is a plain JSON file. You can check it directly from bash without spawning a subprocess:
+
+```bash
+signal="$HOME/.codex-agent/jobs/${id}.turn-complete"
+# Cheapest possible check - no subprocess
+while [ ! -f "$signal" ]; do sleep 1; done
+# Read the agent's message
+cat "$signal"
+```
+
+The `codex-bg -t` wrapper also supports turn notifications:
+
+```bash
+codex-bg -t -- codex-agent start "task"
+# Prints CODEX_AGENT_TURN_COMPLETE=<id> on each turn
+```
 
 ## CLI Reference
 
@@ -258,6 +378,12 @@ codex-agent start "Review these modules" --map -f "src/auth/**/*.ts" -f "src/api
 ### Monitoring Agents
 
 ```bash
+# Wait for agent to finish current turn (PREFERRED - blocks until done)
+codex-agent await-turn <jobId>
+
+# Status with turn info - shows turn state, count, last message
+codex-agent status <jobId>
+
 # Structured status - tokens, files modified, summary
 codex-agent jobs --json
 
@@ -536,25 +662,37 @@ Next: Write PRD to docs/prds/auth-security-hardening.md
 ### Parallel Investigation
 
 ```bash
-# Spawn 3 research agents simultaneously
-codex-agent start "Audit auth flow" --map -s read-only
-codex-agent start "Review API security" --map -s read-only
-codex-agent start "Check data validation" --map -s read-only
+# Spawn 3 research agents simultaneously (parallel Bash calls)
+codex-agent start "Audit auth flow" --map -s read-only          # -> jobA
+codex-agent start "Review API security" --map -s read-only      # -> jobB
+codex-agent start "Check data validation" --map -s read-only    # -> jobC
 
-# Check all at once
-codex-agent jobs --json
+# Await all 3 in parallel (background Bash calls)
+codex-agent await-turn $jobA; codex-agent status $jobA    # bg task 1
+codex-agent await-turn $jobB; codex-agent status $jobB    # bg task 2
+codex-agent await-turn $jobC; codex-agent status $jobC    # bg task 3
+
+# Each notifies you independently the instant its agent finishes
+# Quit each when done reading results
+codex-agent send $jobA "/quit"
+codex-agent send $jobB "/quit"
+codex-agent send $jobC "/quit"
 ```
 
 ### Sequential Implementation
 
 ```bash
 # Phase 1
-codex-agent start "Implement Phase 1 of PRD" --map
-# Wait for completion, review
-codex-agent jobs --json
+codex-agent start "Implement Phase 1 of PRD" --map       # -> job1
+codex-agent await-turn $job1                              # blocks until done
+codex-agent status $job1                                  # review result
+codex-agent send $job1 "/quit"
 
 # Phase 2 (after Phase 1 verified)
-codex-agent start "Implement Phase 2 of PRD" --map
+codex-agent start "Implement Phase 2 of PRD" --map       # -> job2
+codex-agent await-turn $job2
+codex-agent status $job2
+codex-agent send $job2 "/quit"
 ```
 
 ## Quality Gates

@@ -57,3 +57,11 @@ plugins/codex-orchestrator/         # the plugin
 - Uses `script` command for output logging
 - Completion detected via marker string in output
 - Bun is the TypeScript runtime - never use npm/yarn/pnpm for running
+
+## Claude Orchestration Pattern (Persisted)
+
+- Use `codex-agent start "<task>"` without `--wait` for background orchestration.
+- Track job IDs immediately.
+- Use `codex-agent status <id>` to check running/completed state.
+- Use `codex-agent capture <id> [n]` for incremental tails while running.
+- Use `codex-agent output <id>` for final transcript after completion.
