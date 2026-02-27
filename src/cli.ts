@@ -47,7 +47,7 @@ Usage:
 
 Options:
   -r, --reasoning <level>    Reasoning effort: low, medium, high, xhigh (default: xhigh)
-  -m, --model <model>        Model name (default: gpt-5.3-codex-high)
+  -m, --model <model>        Model name (default: gpt-5.3-codex)
   --fast                     Use fast model (gpt-5.3-codex-spark)
   -s, --sandbox <mode>       Sandbox: read-only, workspace-write, danger-full-access
   -w, --wait                 Wait for completion before exiting

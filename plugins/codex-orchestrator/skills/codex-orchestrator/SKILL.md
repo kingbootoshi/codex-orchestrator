@@ -236,7 +236,7 @@ The CLI ships with strong defaults so most commands need minimal flags:
 
 | Setting | Default | Why |
 |---------|---------|-----|
-| Model | `gpt-5.3-codex-high` | Full capability Codex model (use `--fast` for spark) |
+| Model | `gpt-5.3-codex` | Full capability model with xhigh reasoning (use `--fast` for spark) |
 | Reasoning | `xhigh` | Maximum reasoning depth - agents think deeply |
 | Sandbox | `workspace-write` | Agents can modify files by default |
 

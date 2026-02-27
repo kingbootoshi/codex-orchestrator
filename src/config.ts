@@ -1,8 +1,8 @@
 // Configuration for codex-agent
 
 export const config = {
-  // Default model (codex-high for full capability, use --fast for spark)
-  model: "gpt-5.3-codex-high",
+  // Default model (use --fast for spark)
+  model: "gpt-5.3-codex",
   fastModel: "gpt-5.3-codex-spark",
 
   // Reasoning effort levels
