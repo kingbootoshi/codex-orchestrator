@@ -236,7 +236,7 @@ The CLI ships with strong defaults so most commands need minimal flags:
 
 | Setting | Default | Why |
 |---------|---------|-----|
-| Model | `gpt-5.3-codex-spark` | Latest and most capable Codex model |
+| Model | `gpt-5.3-codex-high` | Full capability Codex model (use `--fast` for spark) |
 | Reasoning | `xhigh` | Maximum reasoning depth - agents think deeply |
 | Sandbox | `workspace-write` | Agents can modify files by default |
 
@@ -433,6 +433,7 @@ codex-agent health                 # verify codex + tmux available
 | `--map` | | flag | Include docs/CODEBASE_MAP.md |
 | `--dir` | `-d` | path | Working directory |
 | `--model` | `-m` | string | Model override |
+| `--fast` | | flag | Use fast model (codex-spark) |
 | `--json` | | flag | JSON output (jobs only) |
 | `--strip-ansi` | | flag | Clean output |
 | `--dry-run` | | flag | Preview prompt without executing |
