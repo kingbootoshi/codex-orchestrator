@@ -63,6 +63,24 @@ Or use the automated installer:
 bash <(curl -fsSL https://raw.githubusercontent.com/kingbootoshi/codex-orchestrator/main/plugins/codex-orchestrator/scripts/install.sh)
 ```
 
+### Windows (WSL)
+
+On Windows, the installer automatically detects the environment and routes through WSL:
+
+1. Ensure WSL is installed: `wsl --install` (requires admin PowerShell, restart may be needed)
+2. Run the installer from Git Bash, PowerShell, or CMD:
+   ```bash
+   bash scripts/install.sh
+   ```
+3. The installer will:
+   - Detect Windows and check WSL availability
+   - Run the full install inside WSL (tmux, bun, codex CLI)
+   - Create a Windows-side `codex-agent` shim at `~/bin/codex-agent`
+4. All `codex-agent` commands work directly from Git Bash/PowerShell — no `wsl` prefix needed
+5. Windows paths are automatically converted to WSL paths for `-d` and `-f` flags
+
+**Requirements:** WSL 2 with a default Linux distribution configured.
+
 ### Requirements
 
 | Dependency | Purpose | Install |
@@ -72,7 +90,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/kingbootoshi/codex-orchestra
 | [Codex CLI](https://github.com/openai/codex) | OpenAI's coding agent - the thing being orchestrated | `npm install -g @openai/codex` |
 | OpenAI account | API access for Codex agents | `codex --login` |
 
-**Platform support:** macOS and Linux. Windows users should use WSL.
+**Platform support:** macOS, Linux, and Windows (via WSL — auto-detected).
 
 ## Why?
 

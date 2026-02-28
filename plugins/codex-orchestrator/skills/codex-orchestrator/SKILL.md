@@ -130,6 +130,14 @@ codex --login
 
 **All dependencies use official sources only.** tmux from system package managers, Bun from bun.sh, Codex CLI from npm. No third-party scripts or unknown URLs.
 
+### Windows/WSL
+
+On Windows, codex-agent runs through WSL automatically. The install script detects Windows
+and creates a bridge shim. All commands work directly from Git Bash or PowerShell — no `wsl`
+prefix needed. Paths are auto-converted.
+
+If WSL is not installed, run `wsl --install` from an admin PowerShell first.
+
 ## The Factory Pipeline
 
 ```
