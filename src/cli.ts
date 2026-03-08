@@ -23,7 +23,7 @@ import {
   Job,
   getJobsJson,
 } from "./jobs.ts";
-import { loadFiles, formatPromptWithFiles, estimateTokens, loadCodebaseMap } from "./files.ts";
+import { estimateTokens, loadCodebaseMap } from "./files.ts";
 import { isTmuxAvailable, listSessions } from "./tmux.ts";
 import { cleanTerminalOutput } from "./output-cleaner.ts";
 
@@ -52,7 +52,6 @@ Options:
   -s, --sandbox <mode>       Sandbox: read-only, workspace-write, danger-full-access
   -w, --wait                 Wait for completion before exiting
   --notify-on-complete <cmd>  Run command when job completes
-  -f, --file <glob>          Include files matching glob (can repeat)
   -d, --dir <path>           Working directory (default: cwd)
   --parent-session <id>      Parent session ID for linkage
   --map                      Include codebase map if available
@@ -66,7 +65,7 @@ Options:
 
 Examples:
   # Start an agent
-  codex-agent start "Review this code for security issues" -f "src/**/*.ts"
+  codex-agent start "Review src/ for security issues" --map -s read-only
 
   # Check on it
   codex-agent capture abc123
@@ -93,7 +92,6 @@ interface Options {
   sandbox: SandboxMode;
   waitForCompletion: boolean;
   notifyOnComplete: string | null;
-  files: string[];
   dir: string;
   includeMap: boolean;
   parentSessionId: string | null;
@@ -115,7 +113,6 @@ function parseArgs(args: string[]): {
     sandbox: config.defaultSandbox,
     waitForCompletion: false,
     notifyOnComplete: null,
-    files: [],
     dir: process.cwd(),
     includeMap: false,
     parentSessionId: null,
@@ -157,8 +154,6 @@ function parseArgs(args: string[]): {
         console.error(`Valid options: ${config.sandboxModes.join(", ")}`);
         process.exit(1);
       }
-    } else if (arg === "-f" || arg === "--file") {
-      options.files.push(args[++i]);
     } else if (arg === "-w" || arg === "--wait") {
       options.waitForCompletion = true;
     } else if (arg === "--notify-on-complete") {
@@ -347,13 +342,6 @@ async function main() {
         }
 
         let prompt = positional.join(" ");
-
-        // Load file context if specified
-        if (options.files.length > 0) {
-          const files = await loadFiles(options.files, options.dir);
-          prompt = formatPromptWithFiles(prompt, files);
-          console.error(`Included ${files.length} files`);
-        }
 
         // Include codebase map if requested
         if (options.includeMap) {
