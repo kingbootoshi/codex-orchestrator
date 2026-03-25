@@ -1,15 +1,16 @@
 // Job management for async codex agent execution with tmux
 
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, unlinkSync, statSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, unlinkSync, statSync, renameSync } from "fs";
 import { join } from "path";
 import { config, ReasoningEffort, SandboxMode } from "./config.ts";
 import { randomBytes } from "crypto";
 import { extractSessionId, findSessionFile, parseSessionFile, type ParsedSessionData } from "./session-parser.ts";
 import {
   createSession,
+  cleanupCompletedSessions,
+  cleanupOrphanedSessions,
   killSession,
   sessionExists,
-  getSessionName,
   capturePane,
   captureFullHistory,
   isSessionActive,
@@ -40,6 +41,20 @@ export interface Job {
   turnState?: "working" | "idle" | "context_limit";
 }
 
+interface JobIndexEntry {
+  status: "pending" | "running";
+}
+
+interface JobIndex {
+  updatedAt: string;
+  jobs: Record<string, JobIndexEntry>;
+}
+
+export interface ListJobsOptions {
+  all?: boolean;
+  limit?: number | null;
+}
+
 function ensureJobsDir(): void {
   mkdirSync(config.jobsDir, { recursive: true });
 }
@@ -52,34 +67,183 @@ function getJobPath(jobId: string): string {
   return join(config.jobsDir, `${jobId}.json`);
 }
 
-export function saveJob(job: Job): void {
-  ensureJobsDir();
-  writeFileSync(getJobPath(job.id), JSON.stringify(job, null, 2));
+function createEmptyJobIndex(): JobIndex {
+  return {
+    updatedAt: new Date().toISOString(),
+    jobs: {},
+  };
 }
 
-export function loadJob(jobId: string): Job | null {
+function isActiveJobStatus(status: Job["status"]): status is "pending" | "running" {
+  return status === "pending" || status === "running";
+}
+
+function isJobJsonFile(fileName: string): boolean {
+  return fileName.endsWith(".json") && fileName !== "index.json";
+}
+
+function loadJobFromPath(jobPath: string): Job | null {
   try {
-    const content = readFileSync(getJobPath(jobId), "utf-8");
+    const content = readFileSync(jobPath, "utf-8");
     return JSON.parse(content);
   } catch {
     return null;
   }
 }
 
-export function listJobs(): Job[] {
-  ensureJobsDir();
-  const files = readdirSync(config.jobsDir).filter((f) => f.endsWith(".json"));
+function listAllJobsFromDirectory(): Job[] {
+  const files = readdirSync(config.jobsDir).filter(isJobJsonFile);
   return files
-    .map((f) => {
+    .map((fileName) => loadJobFromPath(join(config.jobsDir, fileName)))
+    .filter((job): job is Job => job !== null)
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+}
+
+function readJobIndex(): JobIndex | null {
+  try {
+    const content = readFileSync(config.jobsIndexFile, "utf-8");
+    const parsed = JSON.parse(content) as Partial<JobIndex>;
+    const jobs = parsed.jobs && typeof parsed.jobs === "object" ? parsed.jobs : {};
+
+    return {
+      updatedAt:
+        typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString(),
+      jobs: Object.fromEntries(
+        Object.entries(jobs).filter(
+          ([jobId, entry]) =>
+            typeof jobId === "string" &&
+            !!entry &&
+            typeof entry === "object" &&
+            (((entry as JobIndexEntry).status === "pending") ||
+              (entry as JobIndexEntry).status === "running")
+        )
+      ) as JobIndex["jobs"],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeJobIndex(index: JobIndex): void {
+  ensureJobsDir();
+  index.updatedAt = new Date().toISOString();
+  // Atomic write: temp file + rename to avoid partial reads from concurrent processes
+  const tmpFile = `${config.jobsIndexFile}.${process.pid}.tmp`;
+  writeFileSync(tmpFile, JSON.stringify(index, null, 2));
+  renameSync(tmpFile, config.jobsIndexFile);
+}
+
+function rebuildJobIndex(): JobIndex {
+  const index = createEmptyJobIndex();
+
+  for (const job of listAllJobsFromDirectory()) {
+    if (isActiveJobStatus(job.status)) {
+      index.jobs[job.id] = { status: job.status };
+    }
+  }
+
+  writeJobIndex(index);
+  return index;
+}
+
+function getOrRebuildJobIndex(): JobIndex {
+  const index = readJobIndex();
+  if (index) return index;
+  return rebuildJobIndex();
+}
+
+function syncJobIndex(job: Job): void {
+  const index = readJobIndex() ?? createEmptyJobIndex();
+
+  if (isActiveJobStatus(job.status)) {
+    index.jobs[job.id] = { status: job.status };
+  } else {
+    delete index.jobs[job.id];
+  }
+
+  writeJobIndex(index);
+}
+
+function removeJobFromIndex(jobId: string): void {
+  const index = readJobIndex();
+  if (!index || !index.jobs[jobId]) return;
+
+  delete index.jobs[jobId];
+  writeJobIndex(index);
+}
+
+function loadIndexedActiveJobs(index: JobIndex): Job[] {
+  const jobs: Job[] = [];
+  let isDirty = false;
+
+  for (const jobId of Object.keys(index.jobs)) {
+    const job = loadJob(jobId);
+    if (!job || !isActiveJobStatus(job.status)) {
+      delete index.jobs[jobId];
+      isDirty = true;
+      continue;
+    }
+
+    jobs.push(job);
+  }
+
+  if (isDirty) {
+    writeJobIndex(index);
+  }
+
+  return jobs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+}
+
+function listRecentJobFilesByMtime(activeJobIds: Set<string>, limit: number): string[] {
+  if (limit <= 0) return [];
+
+  return readdirSync(config.jobsDir)
+    .filter(isJobJsonFile)
+    .filter((fileName) => !activeJobIds.has(fileName.slice(0, -".json".length)))
+    .map((fileName) => {
       try {
-        const content = readFileSync(join(config.jobsDir, f), "utf-8");
-        return JSON.parse(content) as Job;
+        return {
+          fileName,
+          mtimeMs: statSync(join(config.jobsDir, fileName)).mtimeMs,
+        };
       } catch {
         return null;
       }
     })
-    .filter((j): j is Job => j !== null)
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    .filter((entry): entry is { fileName: string; mtimeMs: number } => entry !== null)
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, limit)
+    .map((entry) => entry.fileName);
+}
+
+export function saveJob(job: Job): void {
+  ensureJobsDir();
+  writeFileSync(getJobPath(job.id), JSON.stringify(job, null, 2));
+  syncJobIndex(job);
+}
+
+export function loadJob(jobId: string): Job | null {
+  return loadJobFromPath(getJobPath(jobId));
+}
+
+export function listJobs(options: ListJobsOptions = {}): Job[] {
+  ensureJobsDir();
+  if (options.all) {
+    return listAllJobsFromDirectory();
+  }
+
+  const limit = options.limit ?? config.jobsListLimit;
+  const index = getOrRebuildJobIndex();
+  const activeJobs = loadIndexedActiveJobs(index);
+  const activeJobIds = new Set(activeJobs.map((job) => job.id));
+  const recentLimit = Math.max(limit - activeJobs.length, 0);
+  const recentJobs = listRecentJobFilesByMtime(activeJobIds, recentLimit)
+    .map((fileName) => loadJobFromPath(join(config.jobsDir, fileName)))
+    .filter((job): job is Job => job !== null);
+
+  return [...activeJobs, ...recentJobs].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
 }
 
 function truncateText(value: string, maxLength: number): string {
@@ -165,10 +329,10 @@ export type JobsJsonOutput = {
   jobs: JobsJsonEntry[];
 };
 
-export function getJobsJson(): JobsJsonOutput {
-  const jobs = listJobs();
+export function getJobsJson(options: ListJobsOptions = {}): JobsJsonOutput {
+  const jobs = listJobs(options);
   const enriched = jobs.map((job) => {
-    const refreshed = job.status === "running" ? refreshJobStatus(job.id) : null;
+    const refreshed = (job.status === "running" || job.status === "pending") ? refreshJobStatus(job.id) : null;
     const effective = refreshed ?? job;
     const elapsedMs = computeElapsedMs(effective);
 
@@ -227,6 +391,7 @@ export function deleteJob(jobId: string): boolean {
         // File may not exist
       }
     }
+    removeJobFromIndex(jobId);
     return true;
   } catch {
     return false;
@@ -244,6 +409,7 @@ export interface StartJobOptions {
 
 export function startJob(options: StartJobOptions): Job {
   ensureJobsDir();
+  cleanupCompletedSessions();
 
   const jobId = generateJobId();
   const cwd = options.cwd || process.cwd();
@@ -260,6 +426,10 @@ export function startJob(options: StartJobOptions): Job {
     createdAt: new Date().toISOString(),
   };
 
+  // Record the session name BEFORE creating it so orphan cleanup
+  // never sees a live session without a matching job entry.
+  const expectedSessionName = `${config.tmuxPrefix}-${jobId}`;
+  job.tmuxSession = expectedSessionName;
   saveJob(job);
 
   // Create tmux session with codex
@@ -275,7 +445,6 @@ export function startJob(options: StartJobOptions): Job {
   if (result.success) {
     job.status = "running";
     job.startedAt = new Date().toISOString();
-    job.tmuxSession = result.sessionName;
     job.turnState = "working";
   } else {
     job.status = "failed";
@@ -369,19 +538,35 @@ export function getJobFullOutput(jobId: string): string | null {
   }
 }
 
-export function cleanupOldJobs(maxAgeDays: number = 7): number {
-  const jobs = listJobs();
+export type CleanupResult = {
+  jobsDeleted: number;
+  orphanedSessionsKilled: number;
+};
+
+export function cleanupOldJobs(maxAgeDays: number = 7): CleanupResult {
+  const jobs = listJobs({ all: true });
   const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-  let cleaned = 0;
+  let jobsDeleted = 0;
+
+  const activeSessionNames = new Set(
+    jobs
+      .filter((job) => isActiveJobStatus(job.status) && job.tmuxSession)
+      .map((job) => job.tmuxSession as string)
+  );
+  const orphanedSessionsKilled = cleanupOrphanedSessions(activeSessionNames).length;
 
   for (const job of jobs) {
     const jobTime = new Date(job.completedAt || job.createdAt).getTime();
     if (jobTime < cutoff && (job.status === "completed" || job.status === "failed")) {
-      if (deleteJob(job.id)) cleaned++;
+      if (deleteJob(job.id)) jobsDeleted++;
     }
   }
 
-  return cleaned;
+  rebuildJobIndex();
+  return {
+    jobsDeleted,
+    orphanedSessionsKilled,
+  };
 }
 
 export function isJobRunning(jobId: string): boolean {
@@ -394,6 +579,46 @@ export function isJobRunning(jobId: string): boolean {
 export function refreshJobStatus(jobId: string): Job | null {
   const job = loadJob(jobId);
   if (!job) return null;
+
+  // Repair pending jobs that got stuck
+  if (job.status === "pending" && job.tmuxSession) {
+    if (sessionExists(job.tmuxSession)) {
+      const output = capturePane(job.tmuxSession, { lines: 20 });
+      if (output && output.includes("[codex-agent: Session complete")) {
+        job.status = "completed";
+        job.completedAt = new Date().toISOString();
+        saveJob(job);
+      } else {
+        // Session is alive - promote to running
+        job.status = "running";
+        job.startedAt = job.startedAt || new Date().toISOString();
+        job.turnState = "working";
+        saveJob(job);
+      }
+    } else {
+      // No session and pending for >5 min = orphaned
+      const ageMs = Date.now() - new Date(job.createdAt).getTime();
+      if (ageMs > 5 * 60 * 1000) {
+        job.status = "failed";
+        job.error = "Orphaned pending job - no tmux session found";
+        job.completedAt = new Date().toISOString();
+        saveJob(job);
+      }
+    }
+    return loadJob(jobId);
+  }
+
+  if (job.status === "pending" && !job.tmuxSession) {
+    // No session name recorded and pending for >5 min = failed
+    const ageMs = Date.now() - new Date(job.createdAt).getTime();
+    if (ageMs > 5 * 60 * 1000) {
+      job.status = "failed";
+      job.error = "Orphaned pending job - session never created";
+      job.completedAt = new Date().toISOString();
+      saveJob(job);
+    }
+    return loadJob(jobId);
+  }
 
   if (job.status === "running" && job.tmuxSession) {
     // Check if tmux session still exists
@@ -409,8 +634,13 @@ export function refreshJobStatus(jobId: string): Job | null {
       }
       saveJob(job);
     } else {
-      // Session exists - check if codex is still running
-      // Look for the "[codex-agent: Session complete" marker in output
+      const latestJob = loadJob(jobId);
+      if (latestJob && latestJob.status !== "running") {
+        return latestJob;
+      }
+
+      // Backward-compatible fallback for older leaked sessions that are still
+      // waiting on the legacy completion prompt.
       const output = capturePane(job.tmuxSession, { lines: 20 });
       if (output && output.includes("[codex-agent: Session complete")) {
         job.status = "completed";

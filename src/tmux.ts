@@ -10,6 +10,39 @@ export interface TmuxSession {
   created: string;
 }
 
+const SESSION_COMPLETE_MARKER = "[codex-agent: Session complete";
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function listManagedSessionNames(): string[] {
+  const prefixPattern = `${config.tmuxPrefix}-*`;
+
+  try {
+    const output = execSync(
+      `tmux list-sessions -F "#{session_name}" -f "#{m:${prefixPattern},#{session_name}}" 2>/dev/null`,
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+    ).trim();
+
+    return output ? output.split("\n").filter(Boolean) : [];
+  } catch {
+    try {
+      const output = execSync(
+        `tmux list-sessions -F "#{session_name}" 2>/dev/null`,
+        { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+      );
+
+      return output
+        .trim()
+        .split("\n")
+        .filter((line) => line.startsWith(`${config.tmuxPrefix}-`));
+    } catch {
+      return [];
+    }
+  }
+}
+
 /**
  * Get tmux session name for a job
  */
@@ -54,6 +87,7 @@ export function createSession(options: {
 }): { sessionName: string; success: boolean; error?: string } {
   const sessionName = getSessionName(options.jobId);
   const logFile = `${config.jobsDir}/${options.jobId}.log`;
+  const jobFile = `${config.jobsDir}/${options.jobId}.json`;
   const notifyHook = `${import.meta.dir}/notify-hook.ts`;
 
   // Create prompt file to avoid shell escaping issues
@@ -68,28 +102,70 @@ export function createSession(options: {
       `-c`, `model="${options.model}"`,
       `-c`, `model_reasoning_effort="${options.reasoningEffort}"`,
       `-c`, `skip_update_check=true`,
-      `-c`, `'\\''notify=["bun","run","${notifyHook}","${options.jobId}"]'\\''`,
+      `-c`, shellQuote(`notify=["bun","run","${notifyHook}","${options.jobId}"]`),
       `-a`, `never`,
       `-s`, options.sandbox,
     ].join(" ");
 
+    const indexFile = `${config.jobsDir}/index.json`;
+    const completionScript = [
+      `import { readFileSync, writeFileSync, renameSync } from "fs";`,
+      `const jobPath = process.argv[1];`,
+      `const exitCode = Number(process.argv[2] ?? "0");`,
+      `const indexPath = process.argv[3];`,
+      `try {`,
+      `  const job = JSON.parse(readFileSync(jobPath, "utf-8"));`,
+      `  if (job.status === "running" || job.status === "pending") {`,
+      `    job.status = exitCode === 0 ? "completed" : "failed";`,
+      `    job.completedAt = new Date().toISOString();`,
+      `    job.turnState = "idle";`,
+      `    if (exitCode !== 0 && !job.error) {`,
+      `      job.error = \`Codex exited with code \${exitCode}\`;`,
+      `    }`,
+      `    writeFileSync(jobPath, JSON.stringify(job, null, 2));`,
+      `  }`,
+      `  try {`,
+      `    const idx = JSON.parse(readFileSync(indexPath, "utf-8"));`,
+      `    if (idx.jobs && idx.jobs[job.id]) {`,
+      `      delete idx.jobs[job.id];`,
+      `      idx.updatedAt = new Date().toISOString();`,
+      `      const tmp = indexPath + "." + process.pid + ".tmp";`,
+      `      writeFileSync(tmp, JSON.stringify(idx, null, 2));`,
+      `      renameSync(tmp, indexPath);`,
+      `    }`,
+      `  } catch {}`,
+      `} catch {`,
+      `  process.exit(0);`,
+      `}`,
+    ].join(" ");
+
+    const completionHook = [
+      `exit_code=$?`,
+      `bun -e ${shellQuote(completionScript)} ${shellQuote(jobFile)} "$exit_code" ${shellQuote(indexFile)}`,
+      `echo "\\n\\n[codex-agent: Session complete. Closing in 5s.]"`,
+      `sleep 5`,
+      `tmux kill-session -t ${shellQuote(sessionName)}`,
+    ].join("; ");
+
     // Create tmux session with codex running
-    // Use script to capture all output, and keep shell alive after codex exits
-    // This allows us to capture the output even after completion
-    // Create detached session that runs codex and stays open after it exits
-    // Using script to log all terminal output
+    // Use script to capture all output, then update job state and let the
+    // session terminate itself after a short delay so logs can flush cleanly.
     // AI-DEVNOTE (2026-02-14): Platform-aware script command.
     // macOS: script -q <file> <command>
     // Linux: script -q -c "<command>" <file>
     const isLinux = process.platform === "linux";
     const shellCmd = isLinux
-      ? `script -q -c "codex ${codexArgs}" "${logFile}"; echo "\\n\\n[codex-agent: Session complete. Press Enter to close.]"; read`
-      : `script -q "${logFile}" codex ${codexArgs}; echo "\\n\\n[codex-agent: Session complete. Press Enter to close.]"; read`;
+      ? `script -q -e -c "codex ${codexArgs}" "${logFile}"; ${completionHook}`
+      : `script -q "${logFile}" codex ${codexArgs}; ${completionHook}`;
 
-    execSync(
-      `tmux new-session -d -s "${sessionName}" -c "${options.cwd}" '${shellCmd}'`,
+    const tmuxResult = spawnSync(
+      "tmux",
+      ["new-session", "-d", "-s", sessionName, "-c", options.cwd, shellCmd],
       { stdio: "pipe", cwd: options.cwd }
     );
+    if (tmuxResult.status !== 0) {
+      throw new Error((tmuxResult.stderr || tmuxResult.stdout).toString() || "tmux new-session failed");
+    }
 
     // Give codex a moment to initialize and show update prompt if any
     spawnSync("sleep", ["1"]);
@@ -270,6 +346,62 @@ export function listSessions(): TmuxSession[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Kill codex-agent sessions already sitting on the completion banner
+ */
+export function cleanupCompletedSessions(): string[] {
+  const killed: string[] = [];
+
+  for (const sessionName of listManagedSessionNames()) {
+    const output = capturePane(sessionName, { lines: 20 });
+    if (!output || !output.includes(SESSION_COMPLETE_MARKER)) {
+      continue;
+    }
+
+    if (killSession(sessionName)) {
+      killed.push(sessionName);
+    }
+  }
+
+  return killed;
+}
+
+/**
+ * Kill codex-agent tmux sessions that do not belong to active jobs.
+ * Sessions younger than 30s are skipped to avoid racing with startJob().
+ */
+export function cleanupOrphanedSessions(activeSessionNames: Iterable<string>): string[] {
+  const active = new Set(activeSessionNames);
+  const killed: string[] = [];
+  const now = Date.now();
+
+  for (const sessionName of listManagedSessionNames()) {
+    if (active.has(sessionName)) {
+      continue;
+    }
+
+    // Skip young sessions - they may still be in the startup window
+    // where the job JSON hasn't recorded tmuxSession yet.
+    try {
+      const created = execSync(
+        `tmux display-message -t "${sessionName}" -p "#{session_created}"`,
+        { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+      ).trim();
+      const ageMs = now - parseInt(created, 10) * 1000;
+      if (ageMs < 30_000) continue;
+    } catch {
+      // If we can't read session age, skip it to be safe
+      continue;
+    }
+
+    if (killSession(sessionName)) {
+      killed.push(sessionName);
+    }
+  }
+
+  return killed;
 }
 
 /**

@@ -15,6 +15,7 @@ export const config = {
 
   // Job storage directory
   jobsDir: `${process.env.HOME}/.codex-agent/jobs`,
+  jobsIndexFile: `${process.env.HOME}/.codex-agent/jobs/index.json`,
 
   // Default inactivity timeout in minutes for running jobs
   defaultTimeout: 60,

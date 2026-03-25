@@ -42,7 +42,7 @@ Usage:
   codex-agent jobs [--json]              List all jobs
   codex-agent sessions                   List active tmux sessions
   codex-agent kill <jobId>               Kill running job
-  codex-agent clean                      Clean old completed jobs
+  codex-agent clean                      Clean old completed jobs and orphaned tmux sessions
   codex-agent health                     Check tmux and codex availability
 
 Options:
@@ -223,7 +223,7 @@ function formatJobStatus(job: Job): string {
 
 function refreshJobsForDisplay(jobs: Job[]): Job[] {
   return jobs.map((job) => {
-    if (job.status !== "running") return job;
+    if (job.status !== "running" && job.status !== "pending") return job;
     const refreshed = refreshJobStatus(job.id);
     return refreshed ?? job;
   });
@@ -671,8 +671,11 @@ async function main() {
 
       case "jobs": {
         if (options.json) {
-          const payload = getJobsJson();
           const limit = options.jobsAll ? null : options.jobsLimit;
+          const payload = getJobsJson({
+            all: options.jobsAll,
+            limit,
+          });
           const statusRank: Record<Job["status"], number> = {
             running: 0,
             pending: 1,
@@ -684,14 +687,19 @@ async function main() {
             if (rankDiff !== 0) return rankDiff;
             return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
           });
-          payload.jobs = applyJobsLimit(payload.jobs, limit);
           console.log(JSON.stringify(payload, null, 2));
           break;
         }
 
         const limit = options.jobsAll ? null : options.jobsLimit;
-        const allJobs = refreshJobsForDisplay(listJobs());
-        const jobs = applyJobsLimit(sortJobsRunningFirst(allJobs), limit);
+        const allJobs = refreshJobsForDisplay(
+          listJobs({
+            all: options.jobsAll,
+            limit,
+          })
+        );
+        const sortedJobs = sortJobsRunningFirst(allJobs);
+        const jobs = options.jobsAll ? sortedJobs : applyJobsLimit(sortedJobs, limit);
         if (jobs.length === 0) {
           console.log("No jobs");
         } else {
@@ -738,7 +746,9 @@ async function main() {
 
       case "clean": {
         const cleaned = cleanupOldJobs(7);
-        console.log(`Cleaned ${cleaned} old jobs`);
+        console.log(
+          `Cleaned ${cleaned.jobsDeleted} old jobs and killed ${cleaned.orphanedSessionsKilled} orphaned tmux sessions`
+        );
         break;
       }
 
