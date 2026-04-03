@@ -90,14 +90,14 @@ export function createSession(options: {
   const jobFile = `${config.jobsDir}/${options.jobId}.json`;
   const notifyHook = `${import.meta.dir}/notify-hook.ts`;
 
-  // Create prompt file to avoid shell escaping issues
+  // Write prompt to a file so the shell command can read it without escaping issues
   const promptFile = `${config.jobsDir}/${options.jobId}.prompt`;
   const fs = require("fs");
   fs.writeFileSync(promptFile, options.prompt);
 
   try {
-    // Build the codex command (interactive mode)
-    // We use the interactive TUI so we can send messages later
+    // Build codex args - pass prompt as a CLI argument via $(cat promptFile)
+    // so codex starts processing immediately (no fragile tmux send-keys)
     const codexArgs = [
       `-c`, `model="${options.model}"`,
       `-c`, `model_reasoning_effort="${options.reasoningEffort}"`,
@@ -147,16 +147,16 @@ export function createSession(options: {
       `tmux kill-session -t ${shellQuote(sessionName)}`,
     ].join("; ");
 
-    // Create tmux session with codex running
-    // Use script to capture all output, then update job state and let the
-    // session terminate itself after a short delay so logs can flush cleanly.
+    // Pass prompt via $(cat promptFile) so codex receives it at launch.
+    // This avoids all fragile tmux send-keys timing issues with the TUI.
     // AI-DEVNOTE (2026-02-14): Platform-aware script command.
     // macOS: script -q <file> <command>
     // Linux: script -q -c "<command>" <file>
     const isLinux = process.platform === "linux";
+    const codexCmd = `codex ${codexArgs} "$(cat ${shellQuote(promptFile)})"`;
     const shellCmd = isLinux
-      ? `script -q -e -c "codex ${codexArgs}" "${logFile}"; ${completionHook}`
-      : `script -q "${logFile}" codex ${codexArgs}; ${completionHook}`;
+      ? `script -q -e -c ${shellQuote(codexCmd)} "${logFile}"; ${completionHook}`
+      : `script -q "${logFile}" ${codexCmd}; ${completionHook}`;
 
     const tmuxResult = spawnSync(
       "tmux",
@@ -165,42 +165,6 @@ export function createSession(options: {
     );
     if (tmuxResult.status !== 0) {
       throw new Error((tmuxResult.stderr || tmuxResult.stdout).toString() || "tmux new-session failed");
-    }
-
-    // Give codex a moment to initialize and show update prompt if any
-    spawnSync("sleep", ["1"]);
-
-    // Skip update prompt if it appears by sending "3" (skip until next version)
-    // Then Enter to dismiss any remaining prompts
-    execSync(`tmux send-keys -t "${sessionName}" "3"`, { stdio: "pipe" });
-    spawnSync("sleep", ["0.5"]);
-    execSync(`tmux send-keys -t "${sessionName}" Enter`, { stdio: "pipe" });
-    spawnSync("sleep", ["1"]);
-
-    // Send the prompt (read from file to handle complex prompts)
-    // Using send-keys with the prompt content
-    const promptContent = options.prompt.replace(/'/g, "'\\''"); // Escape single quotes
-
-    // For very long prompts, we'll type it in chunks or use a different approach
-    if (options.prompt.length < 5000) {
-      // Send prompt directly for shorter prompts
-      // Use separate send-keys calls for text and Enter to ensure Enter is processed
-      execSync(
-        `tmux send-keys -t "${sessionName}" '${promptContent}'`,
-        { stdio: "pipe" }
-      );
-      // Small delay to let TUI process the text before Enter
-      spawnSync("sleep", ["0.3"]);
-      execSync(
-        `tmux send-keys -t "${sessionName}" Enter`,
-        { stdio: "pipe" }
-      );
-    } else {
-      // For long prompts, use load-buffer approach
-      execSync(`tmux load-buffer "${promptFile}"`, { stdio: "pipe" });
-      execSync(`tmux paste-buffer -t "${sessionName}"`, { stdio: "pipe" });
-      spawnSync("sleep", ["0.3"]);
-      execSync(`tmux send-keys -t "${sessionName}" Enter`, { stdio: "pipe" });
     }
 
     return { sessionName, success: true };
